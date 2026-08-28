@@ -45,15 +45,20 @@ PERMIT_ID = "233260"  # Mt. Whitney Zone permit product on recreation.gov
 # Dates you want alerts for. Format: "YYYY-MM-DD". Add as many as you like —
 # the more dates you watch, the more chances you have at a cancellation.
 WATCH_DATES = [
-    "2026-08-29",
-    "2026-08-30",
     "2026-09-05",
     "2026-09-06",
+    "2026-09-12",
+    "2026-09-19",
+    "2026-09-26",
+    "2026-10-03",
+    "2026-10-10",
+    "2026-10-24",
+    
 ]
 
 # How many spots you need together. An "opening" only counts as an alert if
 # at least this many spots are free. Set to 1 if any opening at all is useful.
-PARTY_SIZE = 2
+PARTY_SIZE = 3
 
 # Which permit types to watch.
 WATCH_TYPES = ["day", "overnight"]  # any of: "day", "overnight"

@@ -1,0 +1,55 @@
+name: Whitney Permit Watcher
+
+# HOW THIS STAYS "ALWAYS ON" FOR FREE:
+#
+# A single GitHub Actions job can run for up to 6 hours. This workflow runs
+# the watcher in a loop (checking every ~45s) for 5h45m, then exits cleanly.
+# The cron trigger below fires every 5 minutes; the `concurrency` block
+# ensures only one run is ever active at a time, so those extra triggers
+# just wait in a queue — and the instant the current 5h45m run finishes,
+# the most recently queued one starts immediately. Net effect: continuous
+# coverage, with at most a few minutes' gap a handful of times a day, for
+# $0 in GitHub Actions minutes (public repos) or well within the free
+# private-repo minutes allowance.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # needed for the heartbeat commit below
+
+concurrency:
+  group: whitney-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345  # 5h45m — safely under GitHub's 6h hard limit
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run watcher
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MAX_RUNTIME_SECONDS: "20700"  # 5h45m, matches timeout-minutes above
+        run: python watcher.py
+
+      # GitHub auto-disables scheduled workflows after 60 days with no
+      # commits to the repo. This tiny commit each run resets that clock,
+      # so you never have to remember to "wake it back up".
+      - name: Heartbeat commit
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > last_run.txt
+          git config user.name "whitney-watcher-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add last_run.txt
+          git diff --cached --quiet || git commit -m "heartbeat: $(date -u)"
+          git push

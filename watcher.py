@@ -107,8 +107,14 @@ log = logging.getLogger("whitney-watcher")
 
 def http_get_json(url, timeout=15):
     req = Request(url, headers=BASE_HEADERS)
-    with urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        log.error("HTTP %s for URL: %s", e.code, url)
+        log.error("Response body: %s", body)
+        raise
 
 
 def fetch_divisions(permit_id):

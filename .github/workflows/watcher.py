@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+Mt. Whitney permit availability watcher.
+
+Polls Recreation.gov's permit availability data for the Mt. Whitney Zone
+permit product and posts a Discord alert the moment a slot opens up for a
+date / permit-type you're watching, with a direct link to reserve it.
+
+WHAT THIS DOES:  checks public availability, sends you a Discord message.
+WHAT THIS DOES NOT DO:  log into your Recreation.gov account, hold a permit,
+or complete a checkout for you. See the README for why.
+
+--------------------------------------------------------------------------
+A NOTE ON THE API
+
+Recreation.gov's JSON endpoints used below are not officially documented.
+They're the same ones reverse-engineered by several open-source community
+tools (github.com/mdeckebach/recdotgov, github.com/juftin/camply, and
+others), and they've been stable for years, but they could change without
+notice. If alerts stop coming in:
+
+    python watcher.py --debug
+
+This dumps the raw JSON Recreation.gov returns so you (or I, if you paste
+it back to me) can see if a field name changed and fix the one function
+that needs it (extract_remaining, below).
+--------------------------------------------------------------------------
+"""
+
+import os
+import sys
+import json
+import time
+import logging
+import argparse
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+# ----------------------------------------------------------------------------
+# CONFIG — edit this section for your trip, then commit & push
+# ----------------------------------------------------------------------------
+
+PERMIT_ID = "233260"  # Mt. Whitney Zone permit product on recreation.gov
+
+# Dates you want alerts for. Format: "YYYY-MM-DD". Add as many as you like —
+# the more dates you watch, the more chances you have at a cancellation.
+WATCH_DATES = [
+    "2026-08-29",
+    "2026-08-30",
+    "2026-09-05",
+    "2026-09-06",
+]
+
+# How many spots you need together. An "opening" only counts as an alert if
+# at least this many spots are free. Set to 1 if any opening at all is useful.
+PARTY_SIZE = 2
+
+# Which permit types to watch.
+WATCH_TYPES = ["day", "overnight"]  # any of: "day", "overnight"
+
+# How often to poll, in seconds. Set as low as seemed safe: fast enough that
+# you'll basically never lose a race for a cancellation, but not so fast that
+# Recreation.gov's bot protection flags the checker and silently blocks it —
+# which would be worse than checking less often, since you'd stop getting
+# alerts entirely without knowing it. 20s is a reasonable floor for this;
+# if you ever see repeated fetch errors in the Actions logs, that's a sign
+# to back this off (try 30–45) rather than push it lower.
+POLL_INTERVAL_SECONDS = 20
+
+# Re-remind if a slot is still open after this many minutes (so one alert
+# doesn't get buried in your Discord history and you forget to book).
+REMINDER_INTERVAL_MINUTES = 30
+
+# Discord webhook URL — set via the DISCORD_WEBHOOK_URL environment variable
+# / GitHub secret. Don't hardcode it here.
+WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+
+# When running under GitHub Actions, the workflow hands off to a fresh job
+# every ~5h45m (see .github/workflows/watch.yml). This makes the script exit
+# cleanly a little before that job's timeout so the handoff is graceful.
+# Ignore this if you're just running the script yourself on your own machine.
+MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 60 * 60 * 24 * 365))
+
+# ----------------------------------------------------------------------------
+
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; whitney-permit-watcher/1.0; personal, non-commercial use)",
+    "Accept": "application/json",
+}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("whitney-watcher")
+
+
+def http_get_json(url, timeout=15):
+    req = Request(url, headers=BASE_HEADERS)
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_divisions(permit_id):
+    """
+    Returns {division_id: division_name}, e.g.
+    {"1234": "Mt. Whitney Trail - Overnight", "1235": "Mt. Whitney Zone - Day Use"}
+    Pulled from the permit product's content/metadata endpoint.
+    """
+    url = f"https://www.recreation.gov/api/permitcontent/{permit_id}"
+    data = http_get_json(url)
+    divisions = {}
+    for div in data.get("payload", {}).get("divisions", {}).values():
+        div_id = str(div.get("id") or div.get("division_id") or "")
+        if div_id:
+            divisions[div_id] = div.get("name", "")
+    return divisions
+
+
+def pick_division_ids(divisions, watch_types):
+    """Match division names to 'day' / 'overnight' by keyword in the name."""
+    picked = {}
+    for div_id, name in divisions.items():
+        lname = name.lower()
+        if "whitney" not in lname:
+            continue
+        if "overnight" in watch_types and "overnight" in lname:
+            picked[div_id] = ("overnight", name)
+        elif "day" in watch_types and "day" in lname:
+            picked[div_id] = ("day", name)
+    return picked
+
+
+def fetch_availability(permit_id, start_date, end_date):
+    """Raw availability payload for the given date range."""
+    url = (
+        f"https://www.recreation.gov/api/permitinyo/{permit_id}/availabilityv2"
+        f"?start_date={start_date}&end_date={end_date}&commercial_acct=false"
+    )
+    return http_get_json(url)
+
+
+def extract_remaining(payload, division_id, target_date):
+    """
+    Pull the 'remaining spots' number for one division on one date out of
+    the availabilityv2 payload. This is the one function to check first if
+    Recreation.gov changes their API shape — run with --debug to see the
+    raw JSON and adjust the key names below to match.
+    """
+    days = payload.get("payload", {}).get("availability", {})
+    day = days.get(target_date) or days.get(target_date + "T00:00:00Z") or {}
+    div_data = day.get("division_availability") or day.get("quota_by_division") or {}
+    entry = div_data.get(division_id, {})
+    if not entry:
+        return None
+    return entry.get("remaining", entry.get("total_remaining"))
+
+
+def build_reservation_link(permit_id, permit_type, target_date):
+    type_param = "overnight-permit" if permit_type == "overnight" else "day-permit"
+    return (
+        f"https://www.recreation.gov/permits/{permit_id}/registration/"
+        f"detailed-availability?type={type_param}&date={target_date}"
+    )
+
+
+def send_discord_alert(target_date, permit_type, remaining, link):
+    label = "Overnight — Mt. Whitney Trail" if permit_type == "overnight" else "Day Use — Mt. Whitney Zone"
+    content = (
+        f"**🏔️ Whitney permit opening — {label}**\n"
+        f"**Date:** {target_date}\n"
+        f"**Spots open:** {remaining}\n"
+        f"{link}"
+    )
+    if not WEBHOOK_URL:
+        log.warning("DISCORD_WEBHOOK_URL not set — would have sent:\n%s", content)
+        return
+    body = json.dumps({"content": content}).encode("utf-8")
+    req = Request(WEBHOOK_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urlopen(req, timeout=10)
+        log.info("Discord alert sent: %s / %s / %s left", target_date, permit_type, remaining)
+    except (URLError, HTTPError) as e:
+        log.error("Failed to send Discord alert: %s", e)
+
+
+def check_once(divisions_by_type, already_alerted):
+    if not WATCH_DATES:
+        return
+    try:
+        payload = fetch_availability(PERMIT_ID, min(WATCH_DATES), max(WATCH_DATES))
+    except Exception as e:
+        log.error("Availability fetch failed (will retry next cycle): %s", e)
+        return
+
+    reminder_seconds = REMINDER_INTERVAL_MINUTES * 60
+    for target_date in WATCH_DATES:
+        for div_id, (ptype, _name) in divisions_by_type.items():
+            remaining = extract_remaining(payload, div_id, target_date)
+            key = (target_date, div_id)
+            if remaining is not None and remaining >= PARTY_SIZE:
+                first_seen = already_alerted.get(key)
+                if first_seen is None or time.time() - first_seen > reminder_seconds:
+                    link = build_reservation_link(PERMIT_ID, ptype, target_date)
+                    send_discord_alert(target_date, ptype, remaining, link)
+                already_alerted[key] = already_alerted.get(key, time.time())
+            else:
+                already_alerted.pop(key, None)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true", help="dump raw availability JSON and exit")
+    args = parser.parse_args()
+
+    log.info("Looking up permit divisions for permit %s...", PERMIT_ID)
+    try:
+        divisions = fetch_divisions(PERMIT_ID)
+    except Exception as e:
+        log.error("Could not fetch divisions (%s). Recreation.gov's API may have changed — try --debug.", e)
+        sys.exit(1)
+
+    divisions_by_type = pick_division_ids(divisions, WATCH_TYPES)
+    if not divisions_by_type:
+        log.error("Couldn't match any divisions to %s. All divisions found on this permit:", WATCH_TYPES)
+        for div_id, name in divisions.items():
+            log.error("  %s: %s", div_id, name)
+        sys.exit(1)
+
+    log.info("Watching divisions: %s", {k: v[1] for k, v in divisions_by_type.items()})
+    log.info("Watching dates: %s (need >= %d spot(s))", WATCH_DATES, PARTY_SIZE)
+
+    if args.debug:
+        payload = fetch_availability(PERMIT_ID, min(WATCH_DATES), max(WATCH_DATES))
+        print(json.dumps(payload, indent=2)[:6000])
+        return
+
+    already_alerted = {}
+    start_time = time.time()
+    while True:
+        check_once(divisions_by_type, already_alerted)
+        if time.time() - start_time > MAX_RUNTIME_SECONDS:
+            log.info("Max runtime reached — exiting cleanly so the next scheduled run can pick up.")
+            break
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

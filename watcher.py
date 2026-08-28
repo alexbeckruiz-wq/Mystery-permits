@@ -45,6 +45,9 @@ PERMIT_ID = "233260"  # Mt. Whitney Zone permit product on recreation.gov
 # Dates you want alerts for. Format: "YYYY-MM-DD". Add as many as you like —
 # the more dates you watch, the more chances you have at a cancellation.
 WATCH_DATES = [
+    "2026-08-28",
+    "2026-08-29",
+    "2026-08-30",
     "2026-09-05",
     "2026-09-06",
     "2026-09-12",

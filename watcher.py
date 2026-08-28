@@ -14,10 +14,11 @@ or complete a checkout for you. See the README for why.
 A NOTE ON THE API
 
 Recreation.gov's JSON endpoints used below are not officially documented.
-They're the same ones reverse-engineered by several open-source community
-tools (github.com/mdeckebach/recdotgov, github.com/juftin/camply, and
-others), and they've been stable for years, but they could change without
-notice. If alerts stop coming in:
+The exact request shape here (one calendar month per request, and the
+quota_usage_by_member_daily.remaining field) is verified against
+github.com/mdeckebach/recdotgov, a tool built specifically to snapshot
+Recreation.gov permit availability. It's been stable for years, but could
+change without notice. If alerts stop coming in:
 
     python watcher.py --debug
 
@@ -33,6 +34,8 @@ import json
 import time
 import logging
 import argparse
+import calendar
+from datetime import date
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -56,7 +59,6 @@ WATCH_DATES = [
     "2026-10-03",
     "2026-10-10",
     "2026-10-24",
-    
 ]
 
 # How many spots you need together. An "opening" only counts as an alert if
@@ -66,13 +68,12 @@ PARTY_SIZE = 3
 # Which permit types to watch.
 WATCH_TYPES = ["day", "overnight"]  # any of: "day", "overnight"
 
-# How often to poll, in seconds. Set as low as seemed safe: fast enough that
-# you'll basically never lose a race for a cancellation, but not so fast that
-# Recreation.gov's bot protection flags the checker and silently blocks it —
-# which would be worse than checking less often, since you'd stop getting
-# alerts entirely without knowing it. 20s is a reasonable floor for this;
-# if you ever see repeated fetch errors in the Actions logs, that's a sign
-# to back this off (try 30–45) rather than push it lower.
+# How often to poll, in seconds. Note: each cycle makes one request per
+# distinct calendar month covered by WATCH_DATES (Recreation.gov only
+# accepts single-month ranges) — watching 3 months means 3 requests/cycle,
+# not 1. 20s is a reasonable floor for a small handful of months; if you
+# watch many months at once and start seeing repeated fetch errors in the
+# Actions logs, back this off (try 30–45) rather than push it lower.
 POLL_INTERVAL_SECONDS = 20
 
 # Re-remind if a slot is still open after this many minutes (so one alert
@@ -140,8 +141,16 @@ def pick_division_ids(divisions, watch_types):
     return picked
 
 
-def fetch_availability(permit_id, start_date, end_date):
-    """Raw availability payload for the given date range."""
+def month_bounds(year, month):
+    start = date(year, month, 1)
+    end = date(year, month, calendar.monthrange(year, month)[1])
+    return start.isoformat(), end.isoformat()
+
+
+def fetch_availability_month(permit_id, year, month):
+    """One calendar month of availability. Recreation.gov 400s if you ask
+    for a range spanning more than one month, so callers must chunk by month."""
+    start_date, end_date = month_bounds(year, month)
     url = (
         f"https://www.recreation.gov/api/permitinyo/{permit_id}/availabilityv2"
         f"?start_date={start_date}&end_date={end_date}&commercial_acct=false"
@@ -149,20 +158,31 @@ def fetch_availability(permit_id, start_date, end_date):
     return http_get_json(url)
 
 
-def extract_remaining(payload, division_id, target_date):
+def fetch_availability(permit_id, watch_dates):
     """
-    Pull the 'remaining spots' number for one division on one date out of
-    the availabilityv2 payload. This is the one function to check first if
-    Recreation.gov changes their API shape — run with --debug to see the
-    raw JSON and adjust the key names below to match.
+    Fetches every calendar month touched by watch_dates and merges them into
+    one dict keyed by date string ("YYYY-MM-DD") -> {entry_id: entry_data}.
     """
-    days = payload.get("payload", {}).get("availability", {})
-    day = days.get(target_date) or days.get(target_date + "T00:00:00Z") or {}
-    div_data = day.get("division_availability") or day.get("quota_by_division") or {}
-    entry = div_data.get(division_id, {})
+    months_needed = sorted({(int(d[:4]), int(d[5:7])) for d in watch_dates})
+    merged = {}
+    for year, month in months_needed:
+        data = fetch_availability_month(permit_id, year, month)
+        merged.update(data.get("payload", {}))
+    return merged
+
+
+def extract_remaining(availability_by_date, division_id, target_date):
+    """
+    Pull the 'remaining spots' number for one division on one date. This is
+    the one function to check first if Recreation.gov changes their API
+    shape — run with --debug to see the raw JSON and adjust the key names
+    below to match.
+    """
+    day = availability_by_date.get(target_date, {})
+    entry = day.get(division_id) or day.get(str(division_id))
     if not entry:
         return None
-    return entry.get("remaining", entry.get("total_remaining"))
+    return entry.get("quota_usage_by_member_daily", {}).get("remaining")
 
 
 def build_reservation_link(permit_id, permit_type, target_date):
@@ -197,7 +217,7 @@ def check_once(divisions_by_type, already_alerted):
     if not WATCH_DATES:
         return
     try:
-        payload = fetch_availability(PERMIT_ID, min(WATCH_DATES), max(WATCH_DATES))
+        availability_by_date = fetch_availability(PERMIT_ID, WATCH_DATES)
     except Exception as e:
         log.error("Availability fetch failed (will retry next cycle): %s", e)
         return
@@ -205,7 +225,7 @@ def check_once(divisions_by_type, already_alerted):
     reminder_seconds = REMINDER_INTERVAL_MINUTES * 60
     for target_date in WATCH_DATES:
         for div_id, (ptype, _name) in divisions_by_type.items():
-            remaining = extract_remaining(payload, div_id, target_date)
+            remaining = extract_remaining(availability_by_date, div_id, target_date)
             key = (target_date, div_id)
             if remaining is not None and remaining >= PARTY_SIZE:
                 first_seen = already_alerted.get(key)
@@ -240,8 +260,8 @@ def main():
     log.info("Watching dates: %s (need >= %d spot(s))", WATCH_DATES, PARTY_SIZE)
 
     if args.debug:
-        payload = fetch_availability(PERMIT_ID, min(WATCH_DATES), max(WATCH_DATES))
-        print(json.dumps(payload, indent=2)[:6000])
+        availability_by_date = fetch_availability(PERMIT_ID, WATCH_DATES)
+        print(json.dumps(availability_by_date, indent=2)[:6000])
         return
 
     already_alerted = {}
